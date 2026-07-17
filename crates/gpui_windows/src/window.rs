@@ -111,6 +111,7 @@ pub(crate) struct WindowsWindowInner {
 impl WindowsWindowState {
     fn new(
         hwnd: HWND,
+        #[cfg(feature = "wgpu")] gpu_context: gpui_wgpu::GpuContext,
         #[cfg(not(feature = "wgpu"))] directx_devices: &DirectXDevices,
         window_params: &CREATESTRUCTW,
         current_cursor: Option<HCURSOR>,
@@ -139,7 +140,7 @@ impl WindowsWindowState {
         let restore_from_minimized = None;
         #[cfg(feature = "wgpu")]
         let renderer = WgpuRenderer::new(
-            Rc::new(RefCell::new(None)),
+            gpu_context,
             &RawWindow { hwnd },
             WgpuSurfaceConfig {
                 size: physical_size,
@@ -264,6 +265,8 @@ impl WindowsWindowInner {
     fn new(context: &mut WindowCreateContext, hwnd: HWND, cs: &CREATESTRUCTW) -> Result<Rc<Self>> {
         let state = WindowsWindowState::new(
             hwnd,
+            #[cfg(feature = "wgpu")]
+            context.gpu_context.clone(),
             #[cfg(not(feature = "wgpu"))]
             &context.directx_devices,
             cs,
@@ -409,6 +412,8 @@ struct WindowCreateContext {
     is_movable: bool,
     min_size: Option<Size<Pixels>>,
     executor: ForegroundExecutor,
+    #[cfg(feature = "wgpu")]
+    gpu_context: gpui_wgpu::GpuContext,
     current_cursor: Option<HCURSOR>,
     cursor_visible: Arc<AtomicBool>,
     drop_target_helper: IDropTargetHelper,
@@ -434,6 +439,8 @@ impl WindowsWindow {
         let WindowCreationInfo {
             icon,
             executor,
+            #[cfg(feature = "wgpu")]
+            gpu_context,
             current_cursor,
             cursor_visible,
             drop_target_helper,
@@ -520,6 +527,8 @@ impl WindowsWindow {
             is_movable: params.is_movable,
             min_size: params.window_min_size,
             executor,
+            #[cfg(feature = "wgpu")]
+            gpu_context,
             current_cursor,
             cursor_visible,
             drop_target_helper,

@@ -35,6 +35,8 @@ use gpui::*;
 pub struct WindowsPlatform {
     inner: Rc<WindowsPlatformInner>,
     raw_window_handles: Arc<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    #[cfg(feature = "wgpu")]
+    gpu_context: gpui_wgpu::GpuContext,
     // The below members will never change throughout the entire lifecycle of the app.
     headless: bool,
     icon: HICON,
@@ -200,6 +202,8 @@ impl WindowsPlatform {
             inner,
             handle,
             raw_window_handles,
+            #[cfg(feature = "wgpu")]
+            gpu_context: Rc::new(RefCell::new(None)),
             headless,
             icon,
             background_executor,
@@ -235,6 +239,8 @@ impl WindowsPlatform {
         WindowCreationInfo {
             icon: self.icon,
             executor: self.foreground_executor.clone(),
+            #[cfg(feature = "wgpu")]
+            gpu_context: self.gpu_context.clone(),
             current_cursor: self.inner.state.current_cursor.get(),
             cursor_visible: self.inner.state.cursor_visible.clone(),
             drop_target_helper: self.drop_target_helper.clone().unwrap(),
@@ -1077,6 +1083,8 @@ impl Drop for WindowsPlatform {
 pub(crate) struct WindowCreationInfo {
     pub(crate) icon: HICON,
     pub(crate) executor: ForegroundExecutor,
+    #[cfg(feature = "wgpu")]
+    pub(crate) gpu_context: gpui_wgpu::GpuContext,
     pub(crate) current_cursor: Option<HCURSOR>,
     pub(crate) cursor_visible: Arc<AtomicBool>,
     pub(crate) drop_target_helper: IDropTargetHelper,
