@@ -167,8 +167,12 @@ struct WgpuResources {
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
     surface_sampler: wgpu::Sampler,
+    /// Alignment-strided [`SurfaceParams`] slots. Every surface in a scene owns
+    /// a distinct slot so queue writes made before one submit cannot overwrite
+    /// parameters referenced by earlier draws.
     #[allow(dead_code)]
-    surface_uniform_buffer: wgpu::Buffer,
+    surface_params_buffer: wgpu::Buffer,
+    surface_params_capacity: u64,
     /// One reused uniform buffer holding [`BlurParams`] for every blur pass in a frame, each at a
     /// distinct (alignment-strided) offset. Avoids allocating a buffer per pass; distinct offsets
     /// mean `write_buffer`'s last-write-at-submit semantics don't clobber earlier passes.
@@ -222,6 +226,10 @@ impl WgpuResources {
 /// render inline (unblurred at the inner level) rather than allocating unbounded VRAM.
 const MAX_FILTER_DEPTH: usize = 2;
 
+/// A single slot preserves the one-surface fast path. The buffer grows by
+/// powers of two when a scene contains more surfaces.
+const INITIAL_SURFACE_PARAMS_CAPACITY: u64 = 1;
+
 /// Number of [`BlurParams`] slots in the shared blur-params buffer (one per blur pass per frame).
 /// Each frame uses 4 passes per backdrop/group plus one blit; 256 covers dozens of filters.
 const BLUR_PARAMS_SLOTS: u64 = 256;
@@ -244,6 +252,7 @@ pub struct WgpuRenderer {
     instance_buffer_capacity: u64,
     max_buffer_size: u64,
     storage_buffer_alignment: u64,
+    surface_params_stride: u64,
     /// Stride between [`BlurParams`] slots in `blur_params_buffer`, and a per-frame bump cursor
     /// (in slots) handed out to blur passes. Cell so the `&self` blur helpers can advance it.
     blur_params_stride: u64,
@@ -485,14 +494,16 @@ impl WgpuRenderer {
             ..Default::default()
         });
 
-        let surface_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("surface_uniform_buffer"),
-            size: std::mem::size_of::<SurfaceParams>() as u64,
+        let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
+        let surface_params_stride =
+            (std::mem::size_of::<SurfaceParams>() as u64).next_multiple_of(uniform_alignment);
+        let surface_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("surface_params_buffer"),
+            size: surface_params_stride * INITIAL_SURFACE_PARAMS_CAPACITY,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let uniform_alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
         // Shared blur-params buffer: BLUR_PARAMS_SLOTS slots, each one alignment stride apart.
         let blur_params_stride =
             (std::mem::size_of::<BlurParams>() as u64).next_multiple_of(uniform_alignment);
@@ -588,7 +599,8 @@ impl WgpuRenderer {
             bind_group_layouts,
             atlas_sampler,
             surface_sampler,
-            surface_uniform_buffer,
+            surface_params_buffer,
+            surface_params_capacity: INITIAL_SURFACE_PARAMS_CAPACITY,
             blur_params_buffer,
             globals_buffer,
             globals_bind_group,
@@ -622,6 +634,7 @@ impl WgpuRenderer {
             instance_buffer_capacity: initial_instance_buffer_capacity,
             max_buffer_size,
             storage_buffer_alignment,
+            surface_params_stride,
             blur_params_stride,
             blur_params_slot: std::cell::Cell::new(0),
             rendering_params,
@@ -1361,6 +1374,41 @@ impl WgpuRenderer {
         self.max_texture_size
     }
 
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+    fn ensure_surface_params_capacity(&mut self, required_capacity: usize) -> bool {
+        let Ok(required_capacity) = u64::try_from(required_capacity) else {
+            log::error!("surface count does not fit the renderer's address space");
+            return false;
+        };
+        let current_capacity = self.resources().surface_params_capacity;
+        let maximum_capacity = self.max_buffer_size / self.surface_params_stride;
+        let Some(new_capacity) =
+            next_surface_params_capacity(current_capacity, required_capacity, maximum_capacity)
+        else {
+            log::error!(
+                "surface parameter buffer cannot hold {required_capacity} surfaces (maximum {maximum_capacity})"
+            );
+            return false;
+        };
+        if new_capacity == current_capacity {
+            return true;
+        }
+
+        let Some(buffer_size) = self.surface_params_stride.checked_mul(new_capacity) else {
+            log::error!("surface parameter buffer size overflow");
+            return false;
+        };
+        let resources = self.resources_mut();
+        resources.surface_params_buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("surface_params_buffer"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        resources.surface_params_capacity = new_capacity;
+        true
+    }
+
     pub fn draw(&mut self, scene: &Scene) -> bool {
         // Bail out early if the surface has been unconfigured (e.g. during
         // Android background/rotation transitions).  Attempting to acquire
@@ -1395,6 +1443,11 @@ impl WgpuRenderer {
         }
 
         self.atlas.before_frame();
+
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
+        if !self.ensure_surface_params_capacity(scene.surfaces.len()) {
+            return false;
+        }
 
         let frame = match self.resources().surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -1623,7 +1676,12 @@ impl WgpuRenderer {
                                 &mut pass,
                             ),
                         PrimitiveBatch::Surfaces(range) => {
-                            self.draw_surfaces(&scene.surfaces[range], &mut pass)
+                            let first_surface_index = range.start;
+                            self.draw_surfaces(
+                                &scene.surfaces[range],
+                                first_surface_index,
+                                &mut pass,
+                            )
                         }
                         PrimitiveBatch::BackdropFilters(range) => {
                             // Interrupt the current pass, blur the content painted so far behind
@@ -1851,9 +1909,16 @@ impl WgpuRenderer {
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "freebsd"))]
-    fn draw_surfaces(&self, surfaces: &[PaintSurface], pass: &mut wgpu::RenderPass<'_>) -> bool {
+    fn draw_surfaces(
+        &self,
+        surfaces: &[PaintSurface],
+        first_surface_index: usize,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
         let resources = self.resources();
-        for surface in surfaces {
+        let surface_params_size = NonZeroU64::new(std::mem::size_of::<SurfaceParams>() as u64)
+            .expect("SurfaceParams must not be empty");
+        for (local_index, surface) in surfaces.iter().enumerate() {
             let Some(wgpu_texture) = surface.texture.downcast_ref::<wgpu::Texture>() else {
                 continue;
             };
@@ -1865,9 +1930,18 @@ impl WgpuRenderer {
                 content_mask: surface.content_mask.bounds.into(),
             };
 
+            let surface_index = first_surface_index
+                .checked_add(local_index)
+                .expect("surface index must fit usize");
+            let offset = uniform_slot_offset(surface_index, self.surface_params_stride)
+                .expect("surface parameter offset must fit u64");
+            debug_assert!(
+                offset + surface_params_size.get()
+                    <= resources.surface_params_capacity * self.surface_params_stride
+            );
             resources.queue.write_buffer(
-                &resources.surface_uniform_buffer,
-                0,
+                &resources.surface_params_buffer,
+                offset,
                 bytemuck::bytes_of(&params),
             );
 
@@ -1879,7 +1953,11 @@ impl WgpuRenderer {
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
-                            resource: resources.surface_uniform_buffer.as_entire_binding(),
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &resources.surface_params_buffer,
+                                offset,
+                                size: Some(surface_params_size),
+                            }),
                         },
                         wgpu::BindGroupEntry {
                             binding: 1,
@@ -1901,7 +1979,12 @@ impl WgpuRenderer {
     }
 
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "freebsd")))]
-    fn draw_surfaces(&self, _surfaces: &[PaintSurface], _pass: &mut wgpu::RenderPass<'_>) -> bool {
+    fn draw_surfaces(
+        &self,
+        _surfaces: &[PaintSurface],
+        _first_surface_index: usize,
+        _pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
         true
     }
 
@@ -2672,5 +2755,49 @@ impl RenderingParameters {
             grayscale_enhanced_contrast,
             subpixel_enhanced_contrast,
         }
+    }
+}
+
+fn uniform_slot_offset(slot: usize, stride: u64) -> Option<u64> {
+    u64::try_from(slot).ok()?.checked_mul(stride)
+}
+
+fn next_surface_params_capacity(current: u64, required: u64, maximum: u64) -> Option<u64> {
+    if required <= current {
+        return Some(current);
+    }
+    if required > maximum {
+        return None;
+    }
+
+    let mut capacity = current.max(1);
+    while capacity < required {
+        capacity = capacity.checked_mul(2).unwrap_or(maximum).min(maximum);
+    }
+    Some(capacity)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{next_surface_params_capacity, uniform_slot_offset};
+
+    #[test]
+    fn surface_parameter_slots_have_distinct_aligned_offsets() {
+        let stride = 256;
+        let offsets = (0..4)
+            .map(|slot| uniform_slot_offset(slot, stride).expect("valid slot"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(offsets, [0, 256, 512, 768]);
+        assert!(offsets.iter().all(|offset| offset % stride == 0));
+    }
+
+    #[test]
+    fn surface_parameter_capacity_grows_without_wrapping() {
+        assert_eq!(next_surface_params_capacity(1, 1, 16), Some(1));
+        assert_eq!(next_surface_params_capacity(1, 4, 16), Some(4));
+        assert_eq!(next_surface_params_capacity(4, 5, 16), Some(8));
+        assert_eq!(next_surface_params_capacity(8, 13, 13), Some(13));
+        assert_eq!(next_surface_params_capacity(8, 14, 13), None);
     }
 }
